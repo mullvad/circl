@@ -26,6 +26,16 @@ import (
 	"github.com/cloudflare/circl/kem/kyber/kyber1024"
 	"github.com/cloudflare/circl/kem/kyber/kyber512"
 	"github.com/cloudflare/circl/kem/kyber/kyber768"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece348864"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece348864f"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece460896"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece460896f"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece6688128"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece6688128f"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece6960119"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece6960119f"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece8192128"
+	"github.com/cloudflare/circl/kem/mceliece/mceliece8192128f"
 	"github.com/cloudflare/circl/kem/mlkem/mlkem1024"
 	"github.com/cloudflare/circl/kem/mlkem/mlkem512"
 	"github.com/cloudflare/circl/kem/mlkem/mlkem768"
@@ -44,6 +54,16 @@ var allSchemes = [...]kem.Scheme{
 	mlkem512.Scheme(),
 	mlkem768.Scheme(),
 	mlkem1024.Scheme(),
+	mceliece348864.Scheme(),
+	mceliece348864f.Scheme(),
+	mceliece460896.Scheme(),
+	mceliece460896f.Scheme(),
+	mceliece6688128.Scheme(),
+	mceliece6688128f.Scheme(),
+	mceliece6960119.Scheme(),
+	mceliece6960119f.Scheme(),
+	mceliece8192128.Scheme(),
+	mceliece8192128f.Scheme(),
 	hybrid.Kyber512X25519(),
 	hybrid.Kyber768X25519(),
 	hybrid.Kyber768X448(),
