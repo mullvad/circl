@@ -39,7 +39,7 @@ const (
 	syndBytes             = (pkNRows + 7) / 8
 	PublicKeySize         = 261120
 	PrivateKeySize        = 6492
-	CiphertextSize        = 96
+	CiphertextSize        = 128
 	SharedKeySize         = 32
 	seedSize              = 32
 	encapsulationSeedSize = 48
@@ -137,7 +137,7 @@ func deriveKeyPair(entropy []byte) (*PublicKey, *PrivateKey) {
 
 // Encryption routine.
 // Takes a public key `pk` to compute error vector `e` and syndrome `s`.
-func encrypt(s *[CiphertextSize]byte, pk *[PublicKeySize]byte, e *[sysN / 8]byte, rand randFunc) error {
+func encrypt(s, pk, e []byte, rand randFunc) error {
 	err := genE(e, rand)
 	if err != nil {
 		return err
@@ -152,20 +152,23 @@ func encrypt(s *[CiphertextSize]byte, pk *[PublicKeySize]byte, e *[sysN / 8]byte
 // This shared key is returned through parameter `key` whereas
 // the ciphertext (meant to be used for decapsulation) is returned as `c`.
 func kemEncapsulate(c *[CiphertextSize]byte, key *[SharedKeySize]byte, pk *[PublicKeySize]byte, rand randFunc) error {
-	e := [sysN / 8]byte{}
-	oneEC := [1 + sysN/8 + syndBytes]byte{1}
-
-	err := encrypt(c, pk, &e, rand)
+	twoE := [1 + sysN/8]byte{2}
+	e := twoE[1:]
+	oneEC := [1 + sysN/8 + (syndBytes + 32)]byte{1}
+	err := encrypt(c[:], pk[:], e, rand)
 	if err != nil {
 		return err
 	}
-	copy(oneEC[1:1+sysN/8], e[:sysN/8])
-	copy(oneEC[1+sysN/8:1+sysN/8+syndBytes], c[:syndBytes])
+	err = shake256(c[syndBytes:syndBytes+32], twoE[:])
+	if err != nil {
+		return err
+	}
+	copy(oneEC[1:1+sysN/8], twoE[1:1+sysN/8])
+	copy(oneEC[1+sysN/8:1+sysN/8+syndBytes+32], c[0:syndBytes+32])
 	err = shake256(key[0:32], oneEC[:])
 	if err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -174,12 +177,24 @@ func kemEncapsulate(c *[CiphertextSize]byte, key *[SharedKeySize]byte, pk *[Publ
 // Given a secret key `sk` and a ciphertext `c`,
 // determine the shared text `key` negotiated by both parties.
 func kemDecapsulate(key *[SharedKeySize]byte, c *[CiphertextSize]byte, sk *[PrivateKeySize]byte) error {
-	e := [sysN / 8]byte{}
-	preimage := [1 + sysN/8 + syndBytes]byte{}
+	conf := [32]byte{}
+	twoE := [1 + sysN/8]byte{2}
+	e := twoE[1:]
+	preimage := [1 + sysN/8 + (syndBytes + 32)]byte{}
 	s := sk[40+irrBytes+condBytes:]
 
 	retDecrypt := decrypt((*[sysN / 8]byte)(e[:sysN/8]), sk[40:], (*[syndBytes]byte)(c[:syndBytes]))
-	m := retDecrypt
+	err := shake256(conf[0:32], twoE[:])
+	if err != nil {
+		return err
+	}
+
+	var retConfirm byte
+	for i := 0; i < 32; i++ {
+		retConfirm |= conf[i] ^ c[syndBytes+i]
+	}
+
+	m := retDecrypt | uint16(retConfirm)
 	m -= 1
 	m >>= 8
 
@@ -188,18 +203,13 @@ func kemDecapsulate(key *[SharedKeySize]byte, c *[CiphertextSize]byte, sk *[Priv
 		preimage[1+i] = (byte(^m) & s[i]) | (byte(m) & e[i])
 	}
 
-	copy(preimage[1+sysN/8:][:syndBytes], c[0:syndBytes])
-	err := shake256(key[0:32], preimage[:])
-	if err != nil {
-		return err
-	}
-
-	return nil
+	copy(preimage[1+sysN/8:][:syndBytes+32], c[0:syndBytes+32])
+	return shake256(key[0:32], preimage[:])
 }
 
 // input: public key pk, error vector e
 // output: syndrome s
-func syndrome(s *[CiphertextSize]byte, pk *[PublicKeySize]byte, e *[sysN / 8]byte) {
+func syndrome(s []byte, pk []byte, e []byte) {
 	row := [sysN / 8]byte{}
 	var b byte
 
@@ -213,7 +223,7 @@ func syndrome(s *[CiphertextSize]byte, pk *[PublicKeySize]byte, e *[sysN / 8]byt
 		}
 
 		for j := 0; j < pkRowBytes; j++ {
-			row[sysN/8-pkRowBytes+j] = pk[i*pkRowBytes+j]
+			row[sysN/8-pkRowBytes+j] = pk[j]
 		}
 
 		row[i/8] |= 1 << (i % 8)
@@ -229,12 +239,14 @@ func syndrome(s *[CiphertextSize]byte, pk *[PublicKeySize]byte, e *[sysN / 8]byt
 		b &= 1
 
 		s[i/8] |= b << (i % 8)
+
+		pk = pk[pkRowBytes:]
 	}
 }
 
 // Generates `e`, a random error vector of weight `t`.
 // If generation of pseudo-random numbers fails, an error is returned
-func genE(e *[sysN / 8]byte, rand randFunc) error {
+func genE(e []byte, rand randFunc) error {
 	ind := [sysT]uint16{}
 	val := [sysT]byte{}
 	for {

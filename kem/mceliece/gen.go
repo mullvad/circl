@@ -60,7 +60,7 @@ var (
 		Gf:             "gf2e12",
 		PublicKeySize:  261120,
 		PrivateKeySize: 6492,
-		CiphertextSize: 96,
+		CiphertextSize: 128,
 		SysN:           3488,
 		SysT:           64,
 	}
@@ -68,7 +68,7 @@ var (
 		Gf:             "gf2e13",
 		PublicKeySize:  524160,
 		PrivateKeySize: 13608,
-		CiphertextSize: 156,
+		CiphertextSize: 188,
 		SysN:           4608,
 		SysT:           96,
 	}
@@ -76,7 +76,7 @@ var (
 		Gf:             "gf2e13",
 		PublicKeySize:  1044992,
 		PrivateKeySize: 13932,
-		CiphertextSize: 208,
+		CiphertextSize: 240,
 		SysN:           6688,
 		SysT:           128,
 	}
@@ -84,7 +84,7 @@ var (
 		Gf:             "gf2e13",
 		PublicKeySize:  1047319,
 		PrivateKeySize: 13948,
-		CiphertextSize: 194,
+		CiphertextSize: 226,
 		SysN:           6960,
 		SysT:           119,
 	}
@@ -92,7 +92,7 @@ var (
 		Gf:             "gf2e13",
 		PublicKeySize:  1357824,
 		PrivateKeySize: 14120,
-		CiphertextSize: 208,
+		CiphertextSize: 240,
 		SysN:           8192,
 		SysT:           128,
 	}
