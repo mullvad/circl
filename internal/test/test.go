@@ -1,8 +1,16 @@
 package test
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -16,7 +24,7 @@ func ReportError(t testing.TB, got, want interface{}, inputs ...interface{}) {
 	}
 	fmt.Fprintf(b, "got:  %v\nwant: %v", got, want)
 	t.Helper()
-	t.Fatalf(b.String())
+	t.Fatal(b.String())
 }
 
 // CheckOk fails the test if result == false.
@@ -57,4 +65,61 @@ func CheckPanic(f func()) error {
 	}()
 	f()
 	return hasPanicked
+}
+
+func CheckMarshal(
+	t *testing.T,
+	x, y interface {
+		encoding.BinaryMarshaler
+		encoding.BinaryUnmarshaler
+	},
+) {
+	t.Helper()
+
+	want, err := x.MarshalBinary()
+	CheckNoErr(t, err, fmt.Sprintf("cannot marshal %T = %v", x, x))
+
+	err = y.UnmarshalBinary(want)
+	CheckNoErr(t, err, fmt.Sprintf("cannot unmarshal %T from %x", y, want))
+
+	got, err := y.MarshalBinary()
+	CheckNoErr(t, err, fmt.Sprintf("cannot marshal %T = %v", y, y))
+
+	if !bytes.Equal(got, want) {
+		ReportError(t, got, want, x, y)
+	}
+}
+
+// []byte but is encoded in hex for JSON
+type HexBytes []byte
+
+func (b HexBytes) MarshalJSON() ([]byte, error) {
+	return json.Marshal(hex.EncodeToString(b))
+}
+
+func (b *HexBytes) UnmarshalJSON(data []byte) (err error) {
+	var s string
+	if err = json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	*b, err = hex.DecodeString(strings.TrimPrefix(s, "0x"))
+	return err
+}
+
+func gunzip(in []byte) ([]byte, error) {
+	buf := bytes.NewBuffer(in)
+	r, err := gzip.NewReader(buf)
+	if err != nil {
+		return nil, err
+	}
+	return io.ReadAll(r)
+}
+
+// Like os.ReadFile, but gunzip first.
+func ReadGzip(path string) ([]byte, error) {
+	buf, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, err
+	}
+	return gunzip(buf)
 }

@@ -76,12 +76,20 @@ func (f *Formula) UnmarshalBinary(data []byte) error {
 		return fmt.Errorf("too short data")
 	}
 	n := int(binary.LittleEndian.Uint16(data[0:2]))
+	if len(data) < 2+7*n {
+		return fmt.Errorf("too short data")
+	}
 	f.Gates = make([]Gate, n)
 	for i := 0; i < n; i++ {
 		f.Gates[i].Class = int(data[7*i+2])
 		f.Gates[i].In0 = int(binary.LittleEndian.Uint16(data[7*i+2+1:]))
 		f.Gates[i].In1 = int(binary.LittleEndian.Uint16(data[7*i+2+3:]))
 		f.Gates[i].Out = int(binary.LittleEndian.Uint16(data[7*i+2+5:]))
+	}
+	// Reject malformed or cyclic gate graphs coming from untrusted encodings.
+	check := Formula{Gates: append([]Gate(nil), f.Gates...)}
+	if err := check.toposort(); err != nil {
+		return fmt.Errorf("invalid formula: %w", err)
 	}
 	return nil
 }
@@ -190,6 +198,9 @@ func (f *Formula) satisfaction(available []match) ([]match, error) {
 	n := len(f.Gates)
 	assignments := make([][]int, 2*n+1)
 	for _, match := range available {
+		if match.wire < 0 || match.wire >= len(assignments) {
+			return nil, fmt.Errorf("wire index %d out of range for formula with %d gates", match.wire, n)
+		}
 		assignments[match.wire] = []int{match.wire}
 	}
 	for _, gate := range f.Gates {
@@ -253,7 +264,7 @@ func (f *Formula) share(rand io.Reader, k *matrixZp) ([]*matrixZp, error) {
 				return nil, err
 			}
 			shares[gate.In1] = newMatrixZp(k.rows, k.cols)
-			shares[gate.In0].sub(shares[gate.Out], shares[gate.In1])
+			shares[gate.In1].sub(shares[gate.Out], shares[gate.In0])
 
 		case Orgate:
 			shares[gate.In0] = newMatrixZp(k.rows, k.cols)

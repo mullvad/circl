@@ -3,9 +3,11 @@ package tkn20
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -195,6 +197,79 @@ func TestMarshal(t *testing.T) {
 	}
 }
 
+func TestMalformedCiphertext(t *testing.T) {
+	pk, msk, err := Setup(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := Policy{}
+	err = policy.FromString("a:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attrs := Attributes{}
+	attrs.FromMap(map[string]string{"a": "1"})
+	sk, err := msk.KeyGen(rand.Reader, attrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msg := []byte("test")
+	validCT, err := pk.Encrypt(rand.Reader, policy, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty ciphertext must not panic.
+	emptyAttrs := Attributes{}
+	emptyAttrs.FromMap(map[string]string{})
+	_ = emptyAttrs.CouldDecrypt([]byte{})
+	if _, err := sk.Decrypt([]byte{}); err == nil {
+		t.Fatal("empty ciphertext should fail to decrypt")
+	}
+	badPolicy := &Policy{}
+	if err := badPolicy.ExtractFromCiphertext([]byte{}); err == nil {
+		t.Fatal("empty ciphertext should fail extraction")
+	}
+
+	// Truncate the valid ciphertext at every byte and ensure no panic.
+	// DecryptCCA must return an error for any truncation because it needs
+	// the authentication tag, but CouldDecrypt and ExtractFromCiphertext
+	// only need the header and may succeed if the truncation is in the
+	// trailing tag/mac region.
+	for i := 1; i < len(validCT); i++ {
+		truncated := validCT[:i]
+		_ = attrs.CouldDecrypt(truncated)
+		if _, err := sk.Decrypt(truncated); err == nil {
+			t.Fatalf("truncated ciphertext (len=%d) should fail to decrypt", i)
+		}
+		badPolicy = &Policy{}
+		_ = badPolicy.ExtractFromCiphertext(truncated)
+	}
+
+	// Legacy format (no version prefix) with minimal data.
+	legacyTruncated := []byte{0x00, 0x00}
+	_ = attrs.CouldDecrypt(legacyTruncated)
+	if _, err := sk.Decrypt(legacyTruncated); err == nil {
+		t.Fatal("legacy truncated ciphertext should fail to decrypt")
+	}
+	badPolicy = &Policy{}
+	if err := badPolicy.ExtractFromCiphertext(legacyTruncated); err == nil {
+		t.Fatal("legacy truncated ciphertext should fail extraction")
+	}
+
+	// Version prefix with truncated remainder.
+	versionPrefixed := append([]byte("v1.3.8"), []byte{0x00, 0x00}...)
+	_ = attrs.CouldDecrypt(versionPrefixed)
+	if _, err := sk.Decrypt(versionPrefixed); err == nil {
+		t.Fatal("version-prefixed truncated ciphertext should fail to decrypt")
+	}
+	badPolicy = &Policy{}
+	if err := badPolicy.ExtractFromCiphertext(versionPrefixed); err == nil {
+		t.Fatal("version-prefixed truncated ciphertext should fail extraction")
+	}
+}
+
 func TestPolicyMethods(t *testing.T) {
 	policyStr := "(season: fall or season: winter) or (region: alaska and season: summer)"
 	policy := Policy{}
@@ -232,4 +307,223 @@ func TestPolicyMethods(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestPolicyFromStringStackOverflow(t *testing.T) {
+	// Regression test: 4 MB of '(' used to drive ~4,000,000 levels of
+	// expression->or->and->not->primary recursion, exhausting the goroutine
+	// stack and aborting the process with a fatal "stack overflow" error that
+	// no recover() can catch. The parser now bounds its recursion depth and
+	// returns an error instead.
+	var p Policy
+	if err := p.FromString(strings.Repeat("(", 4_000_000)); err == nil {
+		t.Fatal("expected an error for an excessively nested policy, got nil")
+	}
+}
+
+func TestCouldDecryptPanicsOnOversizedWireList(t *testing.T) {
+	le16 := func(n int) []byte {
+		b := make([]byte, 2)
+		binary.LittleEndian.PutUint16(b, uint16(n))
+		return b
+	}
+	pre := func(b []byte) []byte { return append(le16(len(b)), b...) }
+
+	// One serialized Wire: label "x", empty raw value, 32-byte zero scalar, positive.
+	wire := append(pre([]byte("x")), pre([]byte{})...)
+	wire = append(wire, le16(32)...)
+	wire = append(wire, make([]byte, 32)...)
+	wire = append(wire, 1)
+
+	// Formula with zero gates (2 bytes: n=0).
+	formula := le16(0)
+
+	// Policy: 0-gate formula plus THREE wires. After the BK transform the formula
+	// has one gate (wire slots 0,1,2) but the appended BK wire sits at index 3.
+	policy := pre(formula)
+	policy = append(policy, le16(3)...)
+	for i := 0; i < 3; i++ {
+		policy = append(policy, pre(wire)...)
+	}
+
+	// c1: an empty (0x0) matrixG2 -- 4 zero bytes, accepted by unmarshalBinary.
+	c1 := []byte{0, 0, 0, 0}
+
+	// Ciphertext header C1: lenPrefixed(policy) || lenPrefixed(c1) || c2Len=0 || c3Len=0
+	c1Hdr := append(pre(policy), pre(c1)...)
+	c1Hdr = append(c1Hdr, le16(0)...)
+	c1Hdr = append(c1Hdr, le16(0)...)
+
+	macData := pre(c1Hdr)
+	macData = append(macData, pre(make([]byte, 100))...) // env (needed for the Decrypt path)
+
+	// Legacy (pre-v1.3.8) outer format: lenPrefixed(id) || lenPrefixed(macData) || lenPrefixed(tag)
+	ct := pre(make([]byte, 32))
+	ct = append(ct, pre(macData)...)
+	ct = append(ct, pre([]byte{})...)
+
+	attrs := Attributes{}
+	attrs.FromMap(map[string]string{"country": "US"})
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("CouldDecrypt panicked on attacker-controlled ciphertext: %v", r)
+		}
+	}()
+	if attrs.CouldDecrypt(ct) {
+		t.Fatal("malformed ciphertext should not be decryptable")
+	}
+}
+
+// truncateCiphertextHeader takes a legitimate v1.3.8 ciphertext and surgically
+// truncates the inner C1 header right after the (structurally valid) policy and
+// c1 fields, dropping the c2 count and everything after it. The outer envelope
+// is reassembled with corrected length prefixes. Such a header leaves zero bytes
+// where ciphertextHeader.unmarshalBinary reads the c2 element count, which must
+// be rejected with an error rather than an out-of-range panic.
+func truncateCiphertextHeader(t *testing.T, ct []byte) []byte {
+	t.Helper()
+
+	// Ciphertext layout (v1.3.8):
+	//   "v1.3.8" || len16(id) || len32(macData) || len16(tag)
+	//   macData = len32(C1) || len32(env)
+	//   C1      = len16(policy) || len16(c1) || u16(c2Len) || ... || u16(c3Len) || ...
+	const version = "v1.3.8"
+	rest := ct[len(version):]
+	idLen := int(binary.LittleEndian.Uint16(rest))
+	id := rest[2 : 2+idLen]
+	rest = rest[2+idLen:]
+	macLen := int(binary.LittleEndian.Uint32(rest))
+	macData := rest[4 : 4+macLen]
+	rest = rest[4+macLen:]
+	tagLen := int(binary.LittleEndian.Uint16(rest))
+	tag := rest[2 : 2+tagLen]
+
+	c1Len := int(binary.LittleEndian.Uint32(macData))
+	C1 := macData[4 : 4+c1Len]
+	envWithPrefix := macData[4+c1Len:]
+
+	// Truncate C1 right after the (still valid) policy and c1 fields,
+	// dropping the c2 count and everything after it.
+	pLen := int(binary.LittleEndian.Uint16(C1))
+	off := 2 + pLen
+	c1bLen := int(binary.LittleEndian.Uint16(C1[off:]))
+	off += 2 + c1bLen
+	truncC1 := C1[:off]
+
+	// Reassemble the outer ciphertext around the truncated header.
+	newMac := make([]byte, 4, 4+len(truncC1)+len(envWithPrefix))
+	binary.LittleEndian.PutUint32(newMac, uint32(len(truncC1)))
+	newMac = append(newMac, truncC1...)
+	newMac = append(newMac, envWithPrefix...)
+
+	evil := append([]byte{}, []byte(version)...)
+	evil = append(evil, 0, 0)
+	binary.LittleEndian.PutUint16(evil[len(evil)-2:], uint16(len(id)))
+	evil = append(evil, id...)
+	evil = append(evil, 0, 0, 0, 0)
+	binary.LittleEndian.PutUint32(evil[len(evil)-4:], uint32(len(newMac)))
+	evil = append(evil, newMac...)
+	evil = append(evil, 0, 0)
+	binary.LittleEndian.PutUint16(evil[len(evil)-2:], uint16(len(tag)))
+	evil = append(evil, tag...)
+	return evil
+}
+
+// TestTruncatedCiphertextHeaderPanic guards against a denial-of-service in
+// ciphertextHeader.unmarshalBinary: a ciphertext truncated right after the
+// policy and c1 fields must fail gracefully (returning an error / false) on all
+// three public entrypoints rather than panicking.
+func TestTruncatedCiphertextHeaderPanic(t *testing.T) {
+	pk, msk, err := Setup(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := Policy{}
+	if err = policy.FromString("(country: US) and (top: secret)"); err != nil {
+		t.Fatal(err)
+	}
+	ct, err := pk.Encrypt(rand.Reader, policy, []byte("hello world"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	attrs := Attributes{}
+	attrs.FromMap(map[string]string{"country": "US", "top": "secret"})
+	key, err := msk.KeyGen(rand.Reader, attrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evil := truncateCiphertextHeader(t, ct)
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("truncated ciphertext header panicked instead of returning an error: %v", r)
+		}
+	}()
+
+	// Policy.ExtractFromCiphertext must return an error, not panic.
+	extracted := &Policy{}
+	if err := extracted.ExtractFromCiphertext(evil); err == nil {
+		t.Error("ExtractFromCiphertext accepted a malformed ciphertext")
+	}
+
+	// Attributes.CouldDecrypt must return false, not panic.
+	if attrs.CouldDecrypt(evil) {
+		t.Error("CouldDecrypt accepted a malformed ciphertext")
+	}
+
+	// AttributeKey.Decrypt must return an error, not panic.
+	if _, err := key.Decrypt(evil); err == nil {
+		t.Error("Decrypt accepted a malformed ciphertext")
+	}
+}
+
+func TestPolicyExtractMutatedCiphertextStackOverflow(t *testing.T) {
+	pk, _, err := Setup(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var policy Policy
+	if err = policy.FromString("(country: US) and (region: EU)"); err != nil {
+		t.Fatal(err)
+	}
+	ct, err := pk.Encrypt(rand.Reader, policy, []byte("secret"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One-gate formula serialization inside the ciphertext header:
+	// nGates(uint16) | class(byte) | In0(uint16) | In1(uint16) | Out(uint16), little-endian.
+	patterns := [][]byte{
+		{0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00}, // In0=0, In1=1, Out=2
+		{0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00}, // In0=1, In1=0, Out=2
+	}
+	idx := -1
+	for _, p := range patterns {
+		if i := bytes.Index(ct, p); i >= 0 {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("gate encoding not found in ciphertext")
+	}
+	// Attacker mutation: 2 bytes, set the gate's In0 := 2 (its own output wire).
+	// Observed at offset 52+3=55 in the v1.3.8 ciphertext format.
+	ct[idx+3] = 0x02
+	ct[idx+4] = 0x00
+
+	var extracted Policy
+	if err := extracted.ExtractFromCiphertext(ct); err == nil {
+		t.Fatal("ExtractFromCiphertext() accepted a ciphertext with an invalid gate topology")
+	}
+	// Walking this graph would cause a stack overflow:
+	//defer func() {
+	//	if r := recover(); r != nil {
+	//		t.Logf("recovered (does NOT happen for stack overflow): %v", r)
+	//	}
+	//}()
+	//_ = extracted.String() // fatal error: stack overflow — kills the entire process
+	//t.Fatal("unreachable: String() should have crashed the process")
 }

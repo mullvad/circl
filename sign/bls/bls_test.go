@@ -21,6 +21,8 @@ func TestBls(t *testing.T) {
 	t.Run("G2/Errors", testErrors[bls.G2])
 	t.Run("G1/Aggregation", testAggregation[bls.G1])
 	t.Run("G2/Aggregation", testAggregation[bls.G2])
+	t.Run("G1/DuplicatedMsg", testDuplicatedMsgs[bls.G1])
+	t.Run("G2/DuplicatedMsg", testDuplicatedMsgs[bls.G2])
 }
 
 func testBls[K bls.KeyGroup](t *testing.T) {
@@ -101,9 +103,14 @@ func testErrors[K bls.KeyGroup](t *testing.T) {
 	// Bad public key
 	msg := []byte("hello")
 	sig := bls.Sign[K](priv, msg)
-	pub = new(bls.PublicKey[K])
-	test.CheckOk(pub.Validate() == false, "should fail: bad public key", t)
-	test.CheckOk(bls.Verify(pub, msg, sig) == false, "should fail: bad signature", t)
+	badPub := new(bls.PublicKey[K])
+	test.CheckOk(badPub.Validate() == false, "should fail: bad public key", t)
+	test.CheckOk(bls.Verify(badPub, msg, sig) == false, "should fail: bad public key", t)
+
+	// Bad Signature equal to G.Identity
+	badSig := make(bls.Signature, len(sig))
+	badSig[0] = 0xC0
+	test.CheckOk(bls.Verify(pub, msg, badSig) == false, "should fail: bad signature", t)
 
 	// Bad private key
 	priv = new(bls.PrivateKey[K])
@@ -119,11 +126,18 @@ func testErrors[K bls.KeyGroup](t *testing.T) {
 	_, err = bls.Aggregate[K](*new(K), nil)
 	test.CheckIsErr(t, err, "should fail: empty signatures")
 
+	// Aggregate badSig
+	_, err = bls.Aggregate[K](*new(K), []bls.Signature{sig, badSig})
+	test.CheckIsErr(t, err, "should fail: bad signature")
+
 	// VerifyAggregate nil
 	test.CheckOk(bls.VerifyAggregate([]*bls.PublicKey[K]{}, nil, nil) == false, "should fail: empty keys", t)
 
 	// VerifyAggregate empty signature
 	test.CheckOk(bls.VerifyAggregate([]*bls.PublicKey[K]{pub}, [][]byte{msg}, nil) == false, "should fail: empty signature", t)
+
+	// VerifyAggregate bad aggregate signature
+	test.CheckOk(bls.VerifyAggregate([]*bls.PublicKey[K]{pub}, [][]byte{msg}, badSig) == false, "should fail: bad signature", t)
 }
 
 func testAggregation[K bls.KeyGroup](t *testing.T) {
@@ -150,6 +164,34 @@ func testAggregation[K bls.KeyGroup](t *testing.T) {
 
 	ok := bls.VerifyAggregate(pubKeys, msgs, aggSig)
 	test.CheckOk(ok, "failed to verify aggregated signature", t)
+}
+
+func testDuplicatedMsgs[K bls.KeyGroup](t *testing.T) {
+	const N = 3
+
+	ikm := [32]byte{}
+	_, _ = rand.Reader.Read(ikm[:])
+
+	duplicated_msg := []byte("signing the same messsage")
+	msgs := make([][]byte, N)
+	sigs := make([]bls.Signature, N)
+	pubKeys := make([]*bls.PublicKey[K], N)
+
+	for i := range sigs {
+		priv, err := bls.KeyGen[K](ikm[:], nil, nil)
+		test.CheckNoErr(t, err, "failed to keygen")
+		pubKeys[i] = priv.PublicKey()
+
+		msgs[i] = duplicated_msg
+		sigs[i] = bls.Sign(priv, msgs[i])
+	}
+
+	aggSig, err := bls.Aggregate(*new(K), sigs)
+	test.CheckNoErr(t, err, "failed to aggregate")
+
+	test.CheckOk(
+		bls.VerifyAggregate(pubKeys, msgs, aggSig) == false,
+		"failed to reject aggregated signature with duplicated messages", t)
 }
 
 func BenchmarkBls(b *testing.B) {

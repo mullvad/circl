@@ -12,9 +12,10 @@ import (
 	"io"
 	"math/big"
 	"os"
-	"strings"
 	"testing"
 
+	"github.com/cloudflare/circl/blindsign/blindrsa/internal/common"
+	"github.com/cloudflare/circl/blindsign/blindrsa/internal/keys"
 	"github.com/cloudflare/circl/internal/test"
 )
 
@@ -185,6 +186,55 @@ func TestDeterministicBlindFailure(t *testing.T) {
 	}
 }
 
+// TestBlindRejectsNonCoprimeMessage ensures Blind enforces the RFC 9474
+// coprimality check. A malicious signer that publishes an invalid (even)
+// modulus would otherwise learn gcd(encoded_msg, N) from the blinded request,
+// leaking information about low-entropy deterministic messages. Since the
+// EMSA-PSS encoding always ends in the 0xbc trailer, the encoded message is
+// always even, so any even modulus shares the factor 2 with it.
+func TestBlindRejectsNonCoprimeMessage(t *testing.T) {
+	message := []byte("hello world")
+	key, err := loadPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a malicious public key with an even (invalid) modulus of the same
+	// bit length so that the EMSA-PSS encoding is unchanged.
+	maliciousN := new(big.Int).Set(key.N)
+	maliciousN.SetBit(maliciousN, 0, 0) // clear the low bit -> even modulus
+	maliciousPub := &rsa.PublicKey{N: maliciousN, E: key.E}
+
+	for _, variant := range []Variant{
+		SHA384PSSDeterministic,
+		SHA384PSSZeroDeterministic,
+		SHA384PSSRandomized,
+		SHA384PSSZeroRandomized,
+	} {
+		t.Run(variant.String(), func(tt *testing.T) {
+			client, err := NewClient(variant, maliciousPub)
+			if err != nil {
+				tt.Fatal(err)
+			}
+
+			inputMsg, err := client.Prepare(rand.Reader, message)
+			if err != nil {
+				tt.Fatal(err)
+			}
+
+			// Use an invertible blind (r = rInv = 1) so the coprimality
+			// check, rather than the blinding-factor invertibility check,
+			// is what rejects the request.
+			one := big.NewInt(1)
+			salt := make([]byte, client.v.SaltLength)
+			_, _, err = client.fixedBlind(inputMsg, salt, one, one)
+			if err != ErrInvalidMessage {
+				tt.Fatalf("expected ErrInvalidMessage, got %v", err)
+			}
+		})
+	}
+}
+
 func TestRandomSignVerify(t *testing.T) {
 	message := []byte("hello world")
 	key, err := loadPrivateKey()
@@ -259,134 +309,55 @@ func TestFixedRandomSignVerify(t *testing.T) {
 	}
 }
 
-type rawTestVector struct {
-	Name           string `json:"name"`
-	P              string `json:"p"`
-	Q              string `json:"q"`
-	N              string `json:"n"`
-	E              string `json:"e"`
-	D              string `json:"d"`
-	Msg            string `json:"msg"`
-	MsgPrefix      string `json:"msg_prefix"`
-	InputMsg       string `json:"input_msg"`
-	Salt           string `json:"salt"`
-	SaltLen        string `json:"sLen"`
-	IsRandomized   string `json:"is_randomized"`
-	Inv            string `json:"inv"`
-	BlindedMessage string `json:"blinded_msg"`
-	BlindSig       string `json:"blind_sig"`
-	Sig            string `json:"sig"`
-}
-
 type testVector struct {
-	t              *testing.T
-	name           string
-	p              *big.Int
-	q              *big.Int
-	n              *big.Int
-	e              int
-	d              *big.Int
-	msg            []byte
-	msgPrefix      []byte
-	inputMsg       []byte
-	salt           []byte
-	saltLen        int
-	isRandomized   bool
-	blindInverse   *big.Int
-	blindedMessage []byte
-	blindSig       []byte
-	sig            []byte
+	Name           string        `json:"name"`
+	P              bigInt        `json:"p"`
+	Q              bigInt        `json:"q"`
+	N              bigInt        `json:"n"`
+	E              bigInt        `json:"e"`
+	D              bigInt        `json:"d"`
+	Msg            test.HexBytes `json:"msg"`
+	MsgPrefix      test.HexBytes `json:"msg_prefix"`
+	InputMsg       test.HexBytes `json:"input_msg"`
+	Salt           test.HexBytes `json:"salt"`
+	SaltLen        bigInt        `json:"sLen"`
+	IsRandomized   test.HexBytes `json:"is_randomized"`
+	Inv            bigInt        `json:"inv"`
+	BlindedMessage test.HexBytes `json:"blinded_msg"`
+	BlindSig       test.HexBytes `json:"blind_sig"`
+	Sig            test.HexBytes `json:"sig"`
 }
 
-type testVectorList struct {
-	t       *testing.T
-	vectors []testVector
-}
+type bigInt big.Int
 
-func mustUnhexBigInt(number string) *big.Int {
-	data := mustUnhex(number)
-	value := new(big.Int)
-	value.SetBytes(data)
-	return value
-}
-
-func mustUnhex(value string) []byte {
-	value = strings.TrimPrefix(value, "0x")
-	data, err := hex.DecodeString(value)
-	if err != nil {
-		panic(err)
-	}
-
-	return data
-}
-
-func mustUnhexInt(value string) int {
-	number := mustUnhexBigInt(value)
-	result := int(number.Int64())
-	return result
-}
-
-func (tv *testVector) UnmarshalJSON(data []byte) error {
-	raw := rawTestVector{}
-	err := json.Unmarshal(data, &raw)
+func (b *bigInt) UnmarshalJSON(data []byte) error {
+	var h test.HexBytes
+	err := json.Unmarshal(data, &h)
 	if err != nil {
 		return err
 	}
 
-	tv.name = raw.Name
-	tv.p = mustUnhexBigInt(raw.P)
-	tv.q = mustUnhexBigInt(raw.Q)
-	tv.n = mustUnhexBigInt(raw.N)
-	tv.e = mustUnhexInt(raw.E)
-	tv.d = mustUnhexBigInt(raw.D)
-	tv.msg = mustUnhex(raw.Msg)
-	tv.msgPrefix = mustUnhex(raw.MsgPrefix)
-	tv.inputMsg = mustUnhex(raw.InputMsg)
-	tv.salt = mustUnhex(raw.Salt)
-	tv.saltLen = mustUnhexInt(raw.SaltLen)
-	tv.isRandomized = mustUnhexInt(raw.IsRandomized) != 0
-	tv.blindedMessage = mustUnhex(raw.BlindedMessage)
-	tv.blindInverse = mustUnhexBigInt(raw.Inv)
-	tv.blindSig = mustUnhex(raw.BlindSig)
-	tv.sig = mustUnhex(raw.Sig)
-
+	(*big.Int)(b).SetBytes(h)
 	return nil
 }
 
-func (tvl testVectorList) MarshalJSON() ([]byte, error) {
-	return json.Marshal(tvl.vectors)
-}
-
-func (tvl *testVectorList) UnmarshalJSON(data []byte) error {
-	err := json.Unmarshal(data, &tvl.vectors)
-	if err != nil {
-		return err
-	}
-
-	for i := range tvl.vectors {
-		tvl.vectors[i].t = tvl.t
-	}
-
-	return nil
-}
-
-func verifyTestVector(t *testing.T, vector testVector) {
+func (vector testVector) verifyTestVector(t *testing.T) {
 	key := new(rsa.PrivateKey)
-	key.PublicKey.N = vector.n
-	key.PublicKey.E = vector.e
-	key.D = vector.d
-	key.Primes = []*big.Int{vector.p, vector.q}
+	key.PublicKey.N = (*big.Int)(&vector.N)
+	key.PublicKey.E = int((*big.Int)(&vector.E).Uint64())
+	key.D = (*big.Int)(&vector.D)
+	key.Primes = []*big.Int{(*big.Int)(&vector.P), (*big.Int)(&vector.Q)}
 	key.Precomputed.Dp = nil // Remove precomputed CRT values
 
 	// Recompute the original blind
-	rInv := new(big.Int).Set(vector.blindInverse)
+	rInv := (*big.Int)(&vector.Inv)
 	r := new(big.Int).ModInverse(rInv, key.N)
 	if r == nil {
 		t.Fatal("Failed to compute blind inverse")
 	}
 
 	var variant Variant
-	switch vector.name {
+	switch vector.Name {
 	case "RSABSSA-SHA384-PSS-Deterministic":
 		variant = SHA384PSSDeterministic
 	case "RSABSSA-SHA384-PSSZERO-Deterministic":
@@ -404,51 +375,113 @@ func verifyTestVector(t *testing.T, vector testVector) {
 	client, err := NewClient(variant, &key.PublicKey)
 	test.CheckNoErr(t, err, "new client failed")
 
-	blindedMsg, state, err := client.fixedBlind(vector.inputMsg, vector.salt, r, rInv)
+	blindedMsg, state, err := client.fixedBlind(vector.InputMsg, vector.Salt, r, rInv)
 	test.CheckNoErr(t, err, "fixedBlind failed")
-	got := hex.EncodeToString(blindedMsg)
-	want := hex.EncodeToString(vector.blindedMessage)
-	if got != want {
+	got := blindedMsg
+	want := vector.BlindedMessage
+	if !bytes.Equal(got, want) {
 		test.ReportError(t, got, want)
 	}
 
 	blindSig, err := signer.BlindSign(blindedMsg)
 	test.CheckNoErr(t, err, "blindSign failed")
-	got = hex.EncodeToString(blindSig)
-	want = hex.EncodeToString(vector.blindSig)
-	if got != want {
+	got = blindSig
+	want = vector.BlindSig
+	if !bytes.Equal(got, want) {
 		test.ReportError(t, got, want)
 	}
 
 	sig, err := client.Finalize(state, blindSig)
 	test.CheckNoErr(t, err, "finalize failed")
-	got = hex.EncodeToString(sig)
-	want = hex.EncodeToString(vector.sig)
-	if got != want {
+	got = sig
+	want = vector.Sig
+	if !bytes.Equal(got, want) {
 		test.ReportError(t, got, want)
 	}
 
 	verifier, err := NewVerifier(variant, &key.PublicKey)
 	test.CheckNoErr(t, err, "new verifier failed")
 
-	test.CheckNoErr(t, verifier.Verify(vector.inputMsg, sig), "verification failed")
+	test.CheckNoErr(t, verifier.Verify(vector.InputMsg, sig), "verification failed")
 }
 
 func TestVectors(t *testing.T) {
-	data, err := os.ReadFile("testdata/test_vectors_rfc9474.json")
+	input, err := test.ReadGzip("testdata/test_vectors_rfc9474.json.gz")
 	if err != nil {
 		t.Fatal("Failed reading test vectors:", err)
 	}
 
-	tvl := &testVectorList{}
-	err = tvl.UnmarshalJSON(data)
+	var tvl []testVector
+	err = json.Unmarshal(input, &tvl)
 	if err != nil {
 		t.Fatal("Failed deserializing test vectors:", err)
 	}
 
-	for _, vector := range tvl.vectors {
-		t.Run(vector.name, func(tt *testing.T) {
-			verifyTestVector(tt, vector)
+	for _, vector := range tvl {
+		t.Run(vector.Name, vector.verifyTestVector)
+	}
+}
+
+func TestNonCanonicalSignatureRejection(t *testing.T) {
+	message := []byte("hello world")
+	key, err := loadPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, variant := range []Variant{
+		SHA384PSSDeterministic,
+		SHA384PSSZeroDeterministic,
+		SHA384PSSRandomized,
+		SHA384PSSZeroRandomized,
+	} {
+		t.Run(variant.String(), func(tt *testing.T) {
+			client, err := NewClient(variant, &key.PublicKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			signer := NewSigner(key)
+
+			inputMsg, err := client.Prepare(rand.Reader, message)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			blindedMsg, state, err := client.Blind(rand.Reader, inputMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			blindedSig, err := signer.BlindSign(blindedMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			sig, err := client.Finalize(state, blindedSig)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Compute a non-canonical signature representative: s + N
+			s := new(big.Int).SetBytes(sig)
+			s.Add(s, key.N)
+
+			kLen := (key.N.BitLen() + 7) / 8
+			if s.BitLen() > kLen*8 {
+				// s + N overflows the fixed-width encoding, skip this test
+				return
+			}
+
+			sigPlusN := make([]byte, kLen)
+			s.FillBytes(sigPlusN)
+
+			if client.Verify(inputMsg, sigPlusN) == nil {
+				t.Fatal("expected verification to fail for non-canonical signature s+N")
+			}
+
+			if common.VerifyBlindSignature(keys.NewBigPublicKey(client.v.pk), state.encodedMsg, sigPlusN) == nil {
+				t.Fatal("expected VerifyBlindSignature to fail for non-canonical signature s+N")
+			}
 		})
 	}
 }

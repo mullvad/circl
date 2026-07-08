@@ -410,6 +410,9 @@ func (hdr *ciphertextHeader) unmarshalBinary(data []byte) error {
 	if err != nil {
 		return err
 	}
+	if len(data) < 2 {
+		return fmt.Errorf("ciphertext header too short")
+	}
 	c2Len := int(binary.LittleEndian.Uint16(data))
 	hdr.c2 = make([]*matrixG2, c2Len)
 	data = data[2:]
@@ -429,6 +432,9 @@ func (hdr *ciphertextHeader) unmarshalBinary(data []byte) error {
 		}
 	}
 
+	if len(data) < 2 {
+		return fmt.Errorf("ciphertext header too short")
+	}
 	c3Len := int(binary.LittleEndian.Uint16(data))
 	hdr.c3 = make([]*matrixG1, c3Len)
 	hdr.c3neg = make([]*matrixG1, c3Len)
@@ -721,6 +727,17 @@ func decapsulate(header *ciphertextHeader, key *AttributesKey) (*pairing.Gt, err
 	// We use pi to determine which D to sum into
 	pi := header.p.pi()
 	d := max(pi) + 1
+
+	if len(header.c3) < len(header.p.Inputs) {
+		return nil, fmt.Errorf("invalid ciphertext: c3 length %d shorter than %d policy wires", len(header.c3), len(header.p.Inputs))
+	}
+	if len(header.c3neg) < len(header.p.Inputs) {
+		return nil, fmt.Errorf("invalid ciphertext: c3neg length %d shorter than %d policy wires", len(header.c3neg), len(header.p.Inputs))
+	}
+	if len(header.c2) < d {
+		return nil, fmt.Errorf("invalid ciphertext: c2 length %d shorter than required %d", len(header.c2), d)
+	}
+
 	// p1, p2 are the left halves of the pairings.
 	p1 := make([]*matrixG1, d)
 	p2 := make([]*matrixG1, d)
@@ -730,49 +747,56 @@ func decapsulate(header *ciphertextHeader, key *AttributesKey) (*pairing.Gt, err
 		return nil, err
 	}
 	for k := 0; k < len(sat.matches); k++ {
-		match := sat.matches[k]
-		j := pi[match.wire]
+		mt := sat.matches[k]
+		j := pi[mt.wire]
 
 		if p1[j] == nil {
-			p1[j] = newMatrixG1(header.c3[match.wire].rows, header.c3[match.wire].cols)
+			p1[j] = newMatrixG1(header.c3[mt.wire].rows, header.c3[mt.wire].cols)
 		}
 		if p2[j] == nil {
-			p2[j] = newMatrixG1(key.k3[match.label].rows, key.k3[match.label].cols)
+			p2[j] = newMatrixG1(key.k3[mt.label].rows, key.k3[mt.label].cols)
 		}
-		if header.p.Inputs[match.wire].Positive {
-			p1[j].add(p1[j], header.c3[match.wire])
+		if header.p.Inputs[mt.wire].Positive {
+			p1[j].add(p1[j], header.c3[mt.wire])
 
-			if (*key.a)[match.label].wild {
-				if key.k3wild[match.label] == nil {
-					return nil, fmt.Errorf("missing wildcard data for Label %s", match.label)
+			if (*key.a)[mt.label].wild {
+				if key.k3wild[mt.label] == nil {
+					return nil, fmt.Errorf("missing wildcard data for Label %s", mt.label)
 				}
-				y := header.p.Inputs[match.wire].Value
+				y := header.p.Inputs[mt.wire].Value
 				tmp1 := newMatrixG1(0, 0)
-				tmp1.scalarMult(y, key.k3[match.label])
-				tmp1.add(tmp1, key.k3wild[match.label])
+				tmp1.scalarMult(y, key.k3[mt.label])
+				tmp1.add(tmp1, key.k3wild[mt.label])
 				p2[j].add(p2[j], tmp1)
 			} else {
-				p2[j].add(p2[j], key.k3[match.label])
+				p2[j].add(p2[j], key.k3[mt.label])
 			}
 		} else {
+			// c3neg is required for negative wires but is left nil by
+			// unmarshalBinary when its serialized entry is empty. Reject such a
+			// ciphertext instead of dereferencing nil at header.c3neg[mt.wire]
+			// below (this runs before the MAC check in DecryptCCA).
+			if header.c3neg[mt.wire] == nil {
+				return nil, fmt.Errorf("invalid ciphertext: missing c3neg data for negative wire %d", mt.wire)
+			}
 			keymat := newMatrixG1(0, 0)
 			y := &pairing.Scalar{}
 
-			if (*key.a)[match.label].wild {
-				y.Add(header.p.Inputs[match.wire].Value, ToScalar(1))
-				keymat.scalarMult(y, key.k3[match.label])
-				keymat.add(keymat, key.k3wild[match.label])
+			if (*key.a)[mt.label].wild {
+				y.Add(header.p.Inputs[mt.wire].Value, ToScalar(1))
+				keymat.scalarMult(y, key.k3[mt.label])
+				keymat.add(keymat, key.k3wild[mt.label])
 			} else {
-				y.Set((*(key.a))[match.label].Value)
-				keymat.set(key.k3[match.label])
+				y.Set((*(key.a))[mt.label].Value)
+				keymat.set(key.k3[mt.label])
 			}
 			diff := &pairing.Scalar{}
 
-			diff.Sub(header.p.Inputs[match.wire].Value, y)
+			diff.Sub(header.p.Inputs[mt.wire].Value, y)
 			diff.Inv(diff)
 			p1add := newMatrixG1(0, 0)
-			p1add.scalarMult(y, header.c3[match.wire])
-			p1add.add(p1add, header.c3neg[match.wire])
+			p1add.scalarMult(y, header.c3[mt.wire])
+			p1add.add(p1add, header.c3neg[mt.wire])
 			p1add.scalarMult(diff, p1add)
 
 			p2add := newMatrixG1(0, 0)
@@ -794,6 +818,13 @@ func decapsulate(header *ciphertextHeader, key *AttributesKey) (*pairing.Gt, err
 			pTot.add(pTot, p1[i])
 			pairs.addDuals(p2[i], header.c2[i], 1)
 		}
+	}
+	// pTot is nil only when the satisfaction loop matched no wire (e.g. an empty
+	// policy). Satisfaction already returns an error in that case above, so this
+	// is a defensive guard: pairAccum.addDuals dereferences its first argument,
+	// so reaching it with a nil pTot would panic instead of failing cleanly.
+	if pTot == nil {
+		return nil, fmt.Errorf("invalid ciphertext: no satisfying policy wires")
 	}
 	pairs.addDuals(pTot, key.k1, -1)
 	pairs.addDuals(key.k2.copy(), header.c1, 1)

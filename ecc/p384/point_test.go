@@ -4,18 +4,30 @@
 package p384
 
 import (
+	"crypto/ecdh"
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/binary"
+	"slices"
 	"testing"
 
 	"github.com/cloudflare/circl/internal/test"
 )
 
 func randomAffine() *affinePoint {
-	params := elliptic.P384().Params()
-	k, _ := rand.Int(rand.Reader, params.N)
-	return newAffinePoint(params.ScalarBaseMult(k.Bytes()))
+	sk, err := ecdh.P384().GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+
+	b := sk.PublicKey().Bytes()
+	x, y := b[1:1+sizeFp], b[1+sizeFp:1+2*sizeFp]
+	slices.Reverse(x)
+	slices.Reverse(y)
+	p := new(affinePoint)
+	montEncode(&p.x, (*fp384)(x))
+	montEncode(&p.y, (*fp384)(y))
+	return p
 }
 
 func randomJacobian() *jacobianPoint {
@@ -118,13 +130,16 @@ func TestPointAdd(t *testing.T) {
 	})
 
 	t.Run("P+P=2P", func(t *testing.T) {
-		// This verifies that add function cannot be used for doublings.
+		// This verifies that add function can be used for doublings.
 		for i := 0; i < 128; i++ {
 			P = randomJacobian()
+			Q := *P
 
 			R.add(P, P)
 			gotX, gotY := R.toAffine().toInt()
-			wantX, wantY := zeroPoint().toInt()
+
+			Q.double()
+			wantX, wantY := Q.toAffine().toInt()
 
 			if gotX.Cmp(wantX) != 0 {
 				test.ReportError(t, gotX, wantX, P)
